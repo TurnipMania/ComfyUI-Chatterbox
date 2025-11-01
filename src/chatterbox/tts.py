@@ -1,6 +1,8 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import numpy as np
 
 import librosa
 import torch
@@ -42,7 +44,7 @@ def punc_norm(text: str) -> str:
         ("…", ", "),
         (":", ","),
         (" - ", ", "),
-        (";", ", "),
+        (";", ","),
         ("—", "-"),
         ("–", "-"),
         (" ,", ","),
@@ -104,6 +106,7 @@ class Conditionals:
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
+
 # helper function for padding
 def _pad_wav_to_40ms_multiple(wav: torch.Tensor, sr: int) -> torch.Tensor:
     """
@@ -119,6 +122,35 @@ def _pad_wav_to_40ms_multiple(wav: torch.Tensor, sr: int) -> torch.Tensor:
         padded_wav = F.pad(wav, (0, padding_needed))
         return padded_wav
     return wav
+
+
+# ---- pause helpers ----
+def parse_pause_tags(text: str):
+    """
+    Return list of (text_segment, pause_seconds) pairs.
+    Example: [("Hello", 0.5), ("world", 1.0), ("end", 0.0)]
+    """
+    if not text:
+        return [("", 0.0)]
+    pat = r'\[pause:([\d.]+)s\]'
+    segs = []
+    last = 0
+    for m in re.finditer(pat, text):
+        pre = text[last:m.start()].strip()
+        if pre:
+            segs.append((pre, 0.0))
+        dur = round(float(m.group(1)) / 0.1) * 0.1
+        segs.append(("", float(dur)))
+        last = m.end()
+    tail = text[last:].strip()
+    if tail:
+        segs.append((tail, 0.0))
+    return segs or [(text, 0.0)]
+
+
+def create_silence(duration_seconds: float, sample_rate: int) -> torch.Tensor:
+    n = int(duration_seconds * sample_rate)
+    return torch.zeros(1, n)
 
 
 class ChatterboxTTS:
@@ -200,17 +232,17 @@ class ChatterboxTTS:
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-        
+
         # Convert to tensor and pad to a 40ms boundary
         s3gen_ref_wav = torch.from_numpy(s3gen_ref_wav).float().unsqueeze(0)
         s3gen_ref_wav = _pad_wav_to_40ms_multiple(s3gen_ref_wav, S3GEN_SR)
-        
+
         # Now convert back to numpy for librosa, or use torch audio for resampling
         s3gen_ref_wav_np = s3gen_ref_wav.squeeze(0).numpy()
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav_np, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
-        s3gen_ref_wav_np = s3gen_ref_wav_np[:self.DEC_COND_LEN]
+        s3gen_ref_wav_np = s3gen_ref_wav_np[:self.Dec_COND_LEN] if hasattr(self, "Dec_COND_LEN") else s3gen_ref_wav_np[:self.DEC_COND_LEN]
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav_np, S3GEN_SR, device=self.device)
 
         # Speech cond prompt tokens
@@ -229,6 +261,46 @@ class ChatterboxTTS:
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+
+    def _generate_single_segment(self, text, repetition_penalty, min_p, top_p,
+                                 cfg_weight, temperature, pbar, max_new_tokens, flow_cfg_scale):
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        with torch.inference_mode():
+            speech_tokens = self.t3.inference(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                pbar=pbar
+            )
+            speech_tokens = speech_tokens[0]
+            speech_tokens = drop_invalid_tokens(speech_tokens)
+            speech_tokens = speech_tokens[speech_tokens < 6561]
+            speech_tokens = speech_tokens.to(self.device)
+
+            wav, _ = self.s3gen.inference(
+                speech_tokens=speech_tokens,
+                ref_dict=self.conds.gen,
+                flow_cfg_scale=flow_cfg_scale
+            )
+            wav = wav.squeeze(0).detach().cpu().numpy()
+            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
     def generate(
         self,
@@ -258,45 +330,32 @@ class ChatterboxTTS:
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
             ).to(device=self.device)
 
-        # Norm and tokenize text
-        text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        # --- pause-aware path ---
+        segments = parse_pause_tags(text)
 
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
-
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
-
-        with torch.inference_mode():
-            speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                pbar=pbar
+        # No tags → original single pass
+        if len(segments) == 1 and segments[0][1] == 0.0:
+            return self._generate_single_segment(
+                segments[0][0],
+                repetition_penalty, min_p, top_p,
+                cfg_weight, temperature, pbar, max_new_tokens, flow_cfg_scale
             )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
 
-            # TODO: output becomes 1D
-            speech_tokens = drop_invalid_tokens(speech_tokens)
-            
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+        # Tags present → synth chunks and insert silence
+        audio_chunks = []
+        for seg_text, pause_dur in segments:
+            if seg_text.strip():
+                chunk = self._generate_single_segment(
+                    seg_text,
+                    repetition_penalty, min_p, top_p,
+                    cfg_weight, temperature, pbar, max_new_tokens, flow_cfg_scale
+                )
+                audio_chunks.append(chunk.squeeze(0))
+            if pause_dur > 0.0:
+                audio_chunks.append(create_silence(pause_dur, self.sr).squeeze(0))
 
-            speech_tokens = speech_tokens.to(self.device)
+        if not audio_chunks:
+            return create_silence(0.1, self.sr)
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
-                flow_cfg_scale=flow_cfg_scale 
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        final = torch.cat(audio_chunks, dim=0).unsqueeze(0)
+        return final
